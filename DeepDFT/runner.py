@@ -327,7 +327,7 @@ def main():
         optimizer_params = ms.load_checkpoint(os.path.join(args.load_model, "optimizer.ckpt"))
         ms.load_param_into_net(optimizer, optimizer_params)
 
-        with open(os.path.join(args.load_model, "arguments.json"), 'r') as f:
+        with open(os.path.join(args.load_model, "extra_info.json"), 'r') as f:
             runner_args = argparse.Namespace(**json.load(f))
 
         step = runner_args.step
