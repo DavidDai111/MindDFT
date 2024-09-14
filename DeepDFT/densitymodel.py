@@ -32,9 +32,9 @@ class DensityModel(nn.Cell):
             gaussian_expansion_step,
         )
 
-    def consturct(self, input_dict):
+    def construct(self, input_dict):
         atom_representation = self.atom_model(input_dict)
-        probe_result = self.probe_model(input_dict, atom_representation)
+        probe_result = self.probe_model.construct_and_gradients(input_dict, atom_representation)
         return probe_result
 
 
@@ -65,7 +65,7 @@ class PainnDensityModel(nn.Cell):
 
     def construct(self, input_dict):
         atom_representation_scalar, atom_representation_vector = self.atom_model(input_dict)
-        probe_result = self.probe_model(input_dict, atom_representation_scalar, atom_representation_vector)
+        probe_result = self.probe_model.construct_and_gradients(input_dict, atom_representation_scalar, atom_representation_vector)
         return probe_result
 
 

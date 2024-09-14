@@ -8,36 +8,13 @@ import itertools
 import timeit
 
 import numpy as np
-# import torch
-# import torch.utils.data
-# torch.set_num_threads(1)  # Try to avoid thread overload on cluster
 import mindspore as ms
-import mindspore.nn as nn
-import mindspore.ops as ops
+from mindspore import nn, ops
+from mindspore.experimental import optim
 
 import densitymodel
 import dataset
 
-# 这个函数也是用来调试的,用来查看数据结构
-def print_structure(var, indent=0):  
-    if isinstance(var, dict):  
-        print(' ' * indent + '{')  
-        for key in var:  
-            print(' ' * (indent + 2) + 'key:' + key, end=' ')  
-            print_structure(var[key], indent + 2)  
-        print(' ' * indent + '}')  
-    elif isinstance(var, list):  
-        print(' ' * indent + '[')  
-        for item in var:  
-            print_structure(item, indent + 2)  
-        print(' ' * indent + ']')  
-    else:  
-        print(' ' * indent + type(var).__name__)
-
-# 用来实现LambdaLR
-def scheduler_fn(step):
-    lr = 0.96 ** (step / 100000)
-    return lr
 
 def get_arguments(arg_list=None):
     parser = argparse.ArgumentParser(
@@ -77,7 +54,7 @@ def get_arguments(arg_list=None):
         help="Path to output directory",
     )
     parser.add_argument(
-        "--dataset", type=str, default="data/qm9", help="Path to ASE database",
+        "--dataset", type=str, default="data/qm9.db", help="Path to ASE database",
     )
     parser.add_argument(
         "--max_steps",
@@ -86,10 +63,22 @@ def get_arguments(arg_list=None):
         help="Maximum number of optimisation steps",
     )
     parser.add_argument(
-        "--device",
+        "--device_target",
         type=str,
-        default="cuda",
-        help="Set which device to use for training e.g. 'cuda' or 'cpu'",
+        default="GPU",
+        help="Specify the type of device to be used for inference e.g. 'Ascend', 'GPU', or 'CPU'",
+    )
+    parser.add_argument(
+        "--device_id",
+        type=int,
+        default=0,
+        help="Specify the device number to be used for inference e.g. '0' or '1'",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="Pynative",
+        help="Set the operating mode for the inference model for inference e.g. 'Graph' or 'Pynative'",
     )
 
     parser.add_argument(
@@ -112,10 +101,8 @@ def get_arguments(arg_list=None):
 
     return parser.parse_args(arg_list)
 
-
 class AverageMeter(object):
     """Computes and stores the average and current value"""
-
     def __init__(self, name, fmt=':f'):
         self.name = name
         self.fmt = fmt
@@ -136,7 +123,6 @@ class AverageMeter(object):
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
-
 
 def split_data(dataset, args):
     # Load or generate splits
@@ -163,58 +149,33 @@ def split_data(dataset, args):
     return datasplits
 
 
-# def eval_model(model, dataloader, device):
-#    with torch.no_grad():
-#        running_ae = torch.tensor(0., device=device)
-#        running_se = torch.tensor(0., device=device)
-#        running_count = torch.tensor(0., device=device)
-#        for batch in dataloader:
-#            device_batch = {
-#                k: v.to(device=device, non_blocking=True) for k, v in batch.items()
-#            }
-#            outputs = model(device_batch)
-#            targets = device_batch["probe_target"]
-#
-#            running_ae += torch.sum(torch.abs(targets - outputs))
-#            running_se += torch.sum(torch.square(targets - outputs))
-#            running_count += torch.sum(device_batch["num_probes"])
-#
-#        mae = (running_ae / running_count).item()
-#        rmse = (torch.sqrt(running_se / running_count)).item()
-
-#    return mae, rmse
-
-# calculate mse rmse
-def eval_model(model, dataloader, device):
+def eval_model(model, dataloader):
     running_ae = ms.Tensor(0., dtype=ms.float32)
     running_se = ms.Tensor(0., dtype=ms.float32)
     running_count = ms.Tensor(0., dtype=ms.float32)
 
-    for batch in dataloader.create_tuple_iterator():
-        device_batch = {
-            k: ms.Tensor(v, dtype=ms.float32) for k, v in batch.items()
-        }
-        outputs = model(**device_batch)
-        targets = device_batch["probe_target"]
+    for batch in dataloader:
+        batch = batch[0]
+        outputs = model(batch)
+        targets = batch["probe_target"]
 
-        running_ae += ms.ops.abs(targets - outputs).sum()
-        running_se += ms.ops.square(targets - outputs).sum()
-        running_count += device_batch["num_probes"].sum()
+        running_ae += ops.sum(ops.abs(targets - outputs))
+        running_se += ops.sum(ops.square(targets - outputs))
+        running_count += ops.sum(batch["num_probes"])
 
-    mae = (running_ae / running_count).asnumpy()
-    rmse = (ms.ops.sqrt(running_se / running_count)).asnumpy()
+    mae = (running_ae / running_count).item()
+    rmse = (ops.sqrt(running_se / running_count)).item()
 
     return mae, rmse
 
 
-# calculate means and \sqrt Var
 def get_normalization(dataset, per_atom=True):
     try:
         num_targets = len(dataset.transformer.targets)
     except AttributeError:
         num_targets = 1
-    x_sum = ms.ops.zeros(num_targets)
-    x_2 = ms.ops.zeros(num_targets)
+    x_sum = ops.zeros(num_targets)
+    x_2 = ops.zeros(num_targets)
     num_objects = 0
     for sample in dataset:
         x = sample["targets"]
@@ -227,23 +188,11 @@ def get_normalization(dataset, per_atom=True):
     x_mean = x_sum / num_objects
     x_var = x_2 / num_objects - x_mean ** 2.0
 
-    return x_mean, ms.ops.sqrt(x_var)
+    return x_mean, ops.sqrt(x_var)
 
 
-# def count_parameters(model):
-#    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def count_parameters(model):   
-    total_params = 0  
-    for _, param in model.parameters_and_names():  
-        # 如果param.data.size是一个整数，说明是标量，直接加到总数中  
-        if isinstance(param.data.size, int):  
-            total_params += 1  
-        else:  
-            # 否则，使用numel()方法来计算张量中的元素个数  
-            total_params += param.data.size.numel()  
-    return total_params 
-
+def count_parameters(model):
+    return sum(p.size for p in model.trainable_params() if p.requires_grad)
 
 def main():
     args = get_arguments()
@@ -268,25 +217,35 @@ def main():
     with open(os.path.join(args.output_dir, "arguments.json"), "w") as f:
         json.dump(vars(args), f)
 
+    device_target = args.device_target
+    device_id = args.device_id
+    if args.mode == 'Graph':
+        compute_mode = ms.GRAPH_MODE
+    elif args.mode == 'Pynative':
+        compute_mode = ms.PYNATIVE_MODE
+    else:
+        raise ValueError(
+            "Invalid value provided for the 'mode' parameter. Please specify either 'Graph' or 'Pynative'.")
+    ms.set_context(device_target=device_target, device_id=device_id, mode=compute_mode)
+
     # Setup dataset and loader
     if args.dataset.endswith(".txt"):
-        # Text file contains list of datafiles
+    # Text file contains list of datafiles
         with open(args.dataset, "r") as datasetfiles:
             filelist = [os.path.join(os.path.dirname(args.dataset), line.strip('\n')) for line in datasetfiles]
     else:
         filelist = [args.dataset]
 
     logging.info("loading data %s", args.dataset)
-    #    densitydata = torch.utils.data.ConcatDataset([dataset.DensityData(path) for path in filelist])
-    densitydata = dataset.DensityData(filelist[0])
-    # 考虑不用ms
-    # densitydata = ms.dataset.ConcatDataset([dataset.DensityData(path) for path in filelist])
-
-    #########这里暂时将[dataset.DensityData(path) for path in filelist]用filelist[0]替代。
+    densitydata = []
+    for path in filelist:
+        if not densitydata:
+            densitydata = dataset.DensityData(path)
+        else:
+            densitydata.concat(dataset.DensityData(path))
 
     # Split data into train and validation sets
     datasplits = split_data(densitydata, args)
-
     datasplits["train"] = dataset.RotatingPoolData(datasplits["train"], 20)
 
     if args.ignore_pbc and args.force_pbc:
@@ -299,88 +258,82 @@ def main():
         set_pbc = None
 
     # Setup loaders
-    #  train_loader = torch.utils.data.DataLoader(
-    #      datasplits["train"],
-    #      2,
-    #      num_workers=4,
-    #      sampler=torch.utils.data.RandomSampler(datasplits["train"]),
-    #      collate_fn=dataset.CollateFuncRandomSample(args.cutoff, 1000, pin_memory=False, set_pbc_to=set_pbc),
-    #  )
-
-    ### 这里试着将column_names设为data,label, 但是后面会返回错误信息，提示columns_names应该是一维的，所以这里尝试更改columns_names
-    # 1、 312 2、for 可迭代
-    #column_names = ["data", "label"]
     train_loader = ms.dataset.GeneratorDataset(
-        datasplits["train"],
-        #  collate_fn, batch_size通过mindspore.dataset.batch 操作支持
-        num_parallel_workers=4,
-        # sampler=ms.dataset.RandomSampler(datasplits["train"])
+        source=datasplits["train"],
         column_names=["train"],
-        sampler = ms.dataset.RandomSampler(num_samples=len(datasplits["train"]), replacement=False)
+        sampler=ms.dataset.RandomSampler()
     )
-    train_loader = train_loader.map(operations=dataset.CollateFuncRandomSample(args.cutoff, 1000, set_pbc_to=set_pbc),
-                                    input_columns=["train"])
-    train_loader = train_loader.batch(batch_size=2, drop_remainder=True)
-    train_loader = train_loader.repeat(count=-1)
+    train_loader = train_loader.map(
+        operations=[dataset.CollateFuncRandomSample(args.cutoff, 1000, set_pbc_to=set_pbc)],
+    )
+    train_loader = train_loader.batch(batch_size=1, num_parallel_workers=4)
+    # train_loader = [b for b in train_loader]    # 提前将训练集预加载为列表，可以避免报错
 
-    # val_loader = torch.utils.data.DataLoader(
-    #    datasplits["validation"],
-    #    2,
-    #    collate_fn=dataset.CollateFuncRandomSample(args.cutoff, 5000, pin_memory=False, set_pbc_to=set_pbc),
-    #    num_workers=0,
-    # )
-    # logging.info("Preloading validation batch")
     val_loader = ms.dataset.GeneratorDataset(
-        datasplits["validation"],
-        num_parallel_workers=4,
-        column_names=["validations"],
-        sampler=ms.dataset.RandomSampler(num_samples=len(datasplits["validation"]), replacement=False)
+        source=datasplits["validation"],
+        column_names=["validation"],
+        shuffle=False,
     )
-    val_loader = val_loader.map(operations=dataset.CollateFuncRandomSample(args.cutoff, 5000, set_pbc_to=set_pbc),
-                                input_columns=["validations"])
-    val_loader = val_loader.batch(batch_size=2, drop_remainder=True)
+    val_loader = val_loader.map(
+        operations=[dataset.CollateFuncRandomSample(args.cutoff, 1000, set_pbc_to=set_pbc)],
+    )
+    val_loader = val_loader.batch(batch_size=1, num_parallel_workers=4)
+
     logging.info("Preloading validation batch")
+    val_loader = [b for b in val_loader]
 
     # Initialise model
-    # device = torch.device(args.device)
-    device = args.device
-    ### 静态图、动态图都通过
-    ms.context.set_context(device_target='CPU')
-    # net = net.to(device)
     if args.use_painn_model:
-        net = densitymodel.PainnDensityModel(args.num_interactions, args.node_size, args.cutoff)
+        net = densitymodel.PainnDensityModel(args.num_interactions, args.node_size, args.cutoff,)
     else:
-        net = densitymodel.DensityModel(args.num_interactions, args.node_size, args.cutoff)
+        net = densitymodel.DensityModel(args.num_interactions, args.node_size, args.cutoff,)
     logging.debug("model has %d parameters", count_parameters(net))
 
     # Setup optimizer
-    # optimizer = torch.optim.Adam(net.parameters(), lr=0.0001)
-    optimizer = nn.Adam(net.trainable_params(), learning_rate=0.0001)
-    # criterion = torch.nn.MSELoss()
+    optimizer = optim.Adam(net.trainable_params(), lr=0.0001)
     criterion = nn.MSELoss()
-    # scheduler_fn = lambda step: 0.96 ** (step / 100000)
-    # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler_fn)
-    scheduler = ms.train.callback.LearningRateScheduler(scheduler_fn)
+    scheduler_fn = lambda step: 0.96 ** (step / 100000)
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, [scheduler_fn])
+
+    def net_forward(input, output):
+        logit = net(input)
+        loss = criterion(logit, output)
+        return loss
+
+    net_backward = ms.value_and_grad(net_forward, None, optimizer.parameters)
+
+    def train_step(input, output):
+        loss, grads = net_backward(input, output)
+        optimizer(grads)
+        return loss
+
+    # scheduler = nn.learning_rate_schedule.ExponentialDecayLR(learning_rate=1.0, decay_rate=0.96, decay_steps=100000)
+    # optimizer = nn.Adam(net.trainable_params(), learning_rate=scheduler)
+    # criterion = nn.MSELoss()
+    #
+    # loss_net = nn.WithLossCell(net, criterion)
+    # train_net = nn.TrainOneStepCell(loss_net, optimizer)
 
     log_interval = 5000
-    running_loss = ms.tensor(0.0)
-    running_loss_count = ms.tensor(0)
+    running_loss = ms.Tensor(0.0, dtype=ms.float32)
+    running_loss_count = ms.Tensor(0, dtype=ms.int32)
     best_val_mae = np.inf
     step = 0
-    # Restore checkpoint
-    #    if args.load_model:
-    #        state_dict = torch.load(args.load_model)
-    #        net.load_state_dict(state_dict["model"])
-    #        step = state_dict["step"]
-    #        best_val_mae = state_dict["best_val_mae"]
-    #        optimizer.load_state_dict(state_dict["optimizer"])
-    #        scheduler.load_state_dict(state_dict["scheduler"])
-    # 这里使用ms自带的check_point
-    if args.load_model:
-        param_dict = ms.load_checkpoint(args.load_model)
-        ms.load_param_into_net(net, param_dict)
 
-    logging.info("start training")
+    if args.load_model:
+        net_params = ms.load_checkpoint(os.path.join(args.load_model, "model.ckpt"))
+        ms.load_param_into_net(net, net_params)
+
+        optimizer_params = ms.load_checkpoint(os.path.join(args.load_model, "optimizer.ckpt"))
+        ms.load_param_into_net(optimizer, optimizer_params)
+
+        with open(os.path.join(args.load_model, "arguments.json"), 'r') as f:
+            runner_args = argparse.Namespace(**json.load(f))
+
+        step = runner_args.step
+        best_val_mae = runner_args.best_val_mae
+
+        logging.info("start training")
 
     data_timer = AverageMeter("data_timer")
     transfer_timer = AverageMeter("transfer_timer")
@@ -389,46 +342,27 @@ def main():
 
     endtime = timeit.default_timer()
     for _ in itertools.count():
-        print_structure(train_loader[0])
-        for batch_host in train_loader:
-            data_timer.update(timeit.default_timer() - endtime)
+        for batch in train_loader:
+            batch = batch[0]
+            data_timer.update(timeit.default_timer()-endtime)
             tstart = timeit.default_timer()
-            # Transfer to 'device'
-            batch = {
-                k: v.to(device=device, non_blocking=True)
-                for (k, v) in batch_host.items()
-            }
-            transfer_timer.update(timeit.default_timer() - tstart)
-
+            transfer_timer.update(timeit.default_timer()-tstart)
             tstart = timeit.default_timer()
-            # Reset gradient
-            optimizer.zero_grad()
 
-            # Forward, backward and optimize
-            outputs = net(batch)
-            loss = criterion(outputs, batch["probe_target"])
-            loss.backward()
-            optimizer.step()
+            loss = train_step(batch, batch["probe_target"])
 
-            #            with torch.no_grad():
-            #                running_loss += loss * batch["probe_target"].shape[0] * batch["probe_target"].shape[1]
-            #                running_loss_count += torch.sum(batch["num_probes"])
-            running_loss += ops.mul(loss, ops.mul(batch["probe_target"].shape[0], batch["probe_target"].shape[1]))
+            running_loss += loss * batch["probe_target"].shape[0] * batch["probe_target"].shape[1]
             running_loss_count += ops.sum(batch["num_probes"])
 
-            train_timer.update(timeit.default_timer() - tstart)
+            train_timer.update(timeit.default_timer()-tstart)
 
-            # print(step, loss_value)
             # Validate and save model
             if (step % log_interval == 0) or ((step + 1) == args.max_steps):
                 tstart = timeit.default_timer()
-                #                with torch.no_grad():
-                #                    train_loss = (running_loss / running_loss_count).item()
-                #                    running_loss = running_loss_count = 0
-                train_loss = ops.div(running_loss, running_loss_count).item()
-                running_loss = 0
-                running_loss_count = 0
-                val_mae, val_rmse = eval_model(net, val_loader, device)
+                train_loss = (running_loss / running_loss_count).item()
+                running_loss = running_loss_count = 0
+
+                val_mae, val_rmse = eval_model(net, val_loader)
 
                 logging.info(
                     "step=%d, val_mae=%g, val_rmse=%g, sqrt(train_loss)=%g",
@@ -440,35 +374,25 @@ def main():
 
                 # Save checkpoint
                 if val_mae < best_val_mae:
-                    # best_val_mae = val_mae
-                    # torch.save(
-                    #    {
-                    #        "model": net.state_dict(),
-                    #         "optimizer": optimizer.state_dict(),
-                    #         "scheduler": scheduler.state_dict(),
-                    #         "step": step,
-                    #         "best_val_mae": best_val_mae,
-                    #     },
-                    #     os.path.join(args.output_dir, "best_model.pth"),
-                    # )
-                    ms.train.serialization.save_checkpoint(
-                        {
-                            "model": net.parameters_dict(),
-                            "optimizer": optimizer.parameters_dict(),
-                            "scheduler": scheduler,
-                            "step": step,
-                            "best_val_mae": best_val_mae,
-                        },
-                        os.path.join(args.output_dir, "best_model.ckpt"),
+                    best_val_mae = val_mae
+                    ms.save_checkpoint(
+                        net,
+                        os.path.join(args.output_dir, "model.ckpt"),
                     )
-                eval_timer.update(timeit.default_timer() - tstart)
+                    ms.save_checkpoint(
+                        optimizer,
+                        os.path.join(args.output_dir, "optimizer.ckpt"),
+                    )
+                    with open(os.path.join(args.output_dir, "extra_info.json"), 'w') as f:
+                        json.dump({"step": step, "best_val_mae": best_val_mae}, f)
+
+                eval_timer.update(timeit.default_timer()-tstart)
                 logging.debug(
                     "%s %s %s %s" % (data_timer, transfer_timer, train_timer, eval_timer)
                 )
             step += 1
 
-            # scheduler.step()
-            # ms会自动更新scheduler,不需要手动更新。
+            scheduler.step()
 
             if step >= args.max_steps:
                 logging.info("Max steps reached, exiting")
@@ -479,6 +403,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
